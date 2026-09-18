@@ -5,7 +5,7 @@ AWS services — no servers, no containers, no idle cost. A customer places an
 order over HTTPS; it is validated, persisted, queued, paid, and confirmed by
 five services that never call each other directly.
 
-[![CI](https://github.com/YOUR_USERNAME/serverless-order-processing-aws/actions/workflows/ci.yml/badge.svg)](https://github.com/YOUR_USERNAME/serverless-order-processing-aws/actions/workflows/ci.yml)
+[![CI](https://github.com/mohamed-talha-m-g/serverless-order-processing-aws/actions/workflows/ci.yml/badge.svg)](https://github.com/YOUR_USERNAME/serverless-order-processing-aws/actions/workflows/ci.yml)
 [![Python 3.12](https://img.shields.io/badge/python-3.12-blue.svg)](https://www.python.org/downloads/)
 [![Region](https://img.shields.io/badge/region-ap--south--1-orange.svg)](https://docs.aws.amazon.com/general/latest/gr/rande.html)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
