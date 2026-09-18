@@ -1,0 +1,19 @@
+# Copy to samconfig.toml and edit, or just run `sam deploy --guided` once and
+# let the SAM CLI write this file for you. samconfig.toml is gitignored
+# because it pins an account-specific deployment bucket and parameter values.
+
+version = 0.1
+
+[default.deploy.parameters]
+stack_name = "serverless-order-processing"
+region = "ap-south-1"
+capabilities = "CAPABILITY_IAM"
+confirm_changeset = true
+resolve_s3 = true
+
+parameter_overrides = """
+ApiDomainName=""
+AcmCertificateArn=""
+HostedZoneId=""
+OpsAlertEmail=""
+"""

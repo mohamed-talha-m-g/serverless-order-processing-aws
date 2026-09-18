@@ -1,0 +1,380 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Serverless order processing — API Gateway -> OrderService -> DynamoDB -> SQS
+  -> PaymentService -> SNS -> NotificationService, with dead letter queues,
+  CloudWatch alarms and least-privilege IAM.
+
+# ---------------------------------------------------------------------------
+# Parameters — all optional. Deploy with `sam deploy --guided` and accept the
+# defaults for a plain execute-api endpoint with no custom domain.
+# ---------------------------------------------------------------------------
+Parameters:
+
+  ApiDomainName:
+    Type: String
+    Default: ""
+    Description: >
+      Custom domain for the API, e.g. api.redsparrowenterprise.in. Leave blank
+      to skip custom-domain setup and use the generated execute-api URL.
+
+  AcmCertificateArn:
+    Type: String
+    Default: ""
+    Description: >
+      ARN of an ACM certificate covering ApiDomainName. It must be issued in
+      THIS region: the us-east-1 requirement applies to CloudFront and
+      edge-optimized endpoints, not to regional HTTP API custom domains.
+
+  HostedZoneId:
+    Type: String
+    Default: ""
+    Description: >
+      Route 53 hosted zone ID for the domain. Supply it to have this stack
+      create the DNS alias record; leave blank to create the record yourself
+      using the RegionalDomainNameForDns output.
+
+  OpsAlertEmail:
+    Type: String
+    Default: ""
+    Description: >
+      Address to notify when a CloudWatch alarm fires. Kept separate from the
+      customer notification topic on purpose. Leave blank to create the alarms
+      without a subscriber.
+
+Conditions:
+  UseCustomDomain: !Not [!Equals [!Ref ApiDomainName, ""]]
+  CreateDnsRecord: !And
+    - !Condition UseCustomDomain
+    - !Not [!Equals [!Ref HostedZoneId, ""]]
+  HasOpsEmail: !Not [!Equals [!Ref OpsAlertEmail, ""]]
+
+Globals:
+  Function:
+    Runtime: python3.12
+    MemorySize: 256
+    Timeout: 10
+    Tracing: Active                 # AWS X-Ray
+    Environment:
+      Variables:
+        LOG_LEVEL: INFO
+    Tags:
+      Project: serverless-order-processing
+
+Resources:
+
+  # -------------------------------------------------------------------------
+  # Storage
+  # -------------------------------------------------------------------------
+  OrdersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: Orders
+      BillingMode: PAY_PER_REQUEST            # scales to zero, no capacity planning
+      AttributeDefinitions:
+        - AttributeName: orderId
+          AttributeType: S
+        - AttributeName: customerId
+          AttributeType: S
+        - AttributeName: status
+          AttributeType: S
+      KeySchema:
+        - AttributeName: orderId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        # "every order for this customer" and "every order stuck in PLACED"
+        # are both full table scans without these.
+        - IndexName: CustomerIndex
+          KeySchema:
+            - AttributeName: customerId
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+        - IndexName: StatusIndex
+          KeySchema:
+            - AttributeName: status
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      SSESpecification:
+        SSEEnabled: true                      # encryption at rest
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true      # continuous backups
+
+  # -------------------------------------------------------------------------
+  # Messaging
+  # -------------------------------------------------------------------------
+  OrderQueueDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: OrderQueueDLQ
+      MessageRetentionPeriod: 1209600         # 14 days, the maximum
+
+  OrderQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: OrderQueue
+      VisibilityTimeout: 30                   # must exceed PaymentService's timeout
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt OrderQueueDLQ.Arn
+        maxReceiveCount: 3
+
+  NotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: OrderNotification
+
+  NotificationDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: NotificationDLQ
+      MessageRetentionPeriod: 1209600
+
+  # -------------------------------------------------------------------------
+  # Compute
+  # -------------------------------------------------------------------------
+  OrderServiceFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: OrderService
+      CodeUri: ../lambda_functions/order_service/
+      Handler: app.lambda_handler
+      Environment:
+        Variables:
+          ORDERS_TABLE: !Ref OrdersTable
+          ORDER_QUEUE_URL: !Ref OrderQueue
+      Policies:
+        - DynamoDBWritePolicy:
+            TableName: !Ref OrdersTable
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt OrderQueue.QueueName
+      Events:
+        PlaceOrder:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref OrderingHttpApi
+            Path: /order
+            Method: POST
+
+  PaymentServiceFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: PaymentService
+      CodeUri: ../lambda_functions/payment_service/
+      Handler: app.lambda_handler
+      Environment:
+        Variables:
+          ORDERS_TABLE: !Ref OrdersTable
+          NOTIFICATION_TOPIC_ARN: !Ref NotificationTopic
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref OrdersTable
+        - SNSPublishMessagePolicy:
+            TopicName: !GetAtt NotificationTopic.TopicName
+      Events:
+        OrderQueueEvent:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt OrderQueue.Arn
+            BatchSize: 10
+            FunctionResponseTypes:
+              # The handler returns batchItemFailures; without this the whole
+              # batch is retried whenever any single message fails.
+              - ReportBatchItemFailures
+
+  NotificationServiceFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: NotificationService
+      CodeUri: ../lambda_functions/notification_service/
+      Handler: app.lambda_handler
+      Environment:
+        Variables:
+          ORDERS_TABLE: !Ref OrdersTable
+      Policies:
+        - DynamoDBWritePolicy:
+            TableName: !Ref OrdersTable
+      DeadLetterQueue:
+        Type: SQS
+        TargetArn: !GetAtt NotificationDLQ.Arn
+      Events:
+        SnsEvent:
+          Type: SNS
+          Properties:
+            Topic: !Ref NotificationTopic
+
+  # -------------------------------------------------------------------------
+  # API
+  # -------------------------------------------------------------------------
+  OrderingHttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      StageName: prod
+      # Before this faces the internet, add an authorizer so callers cannot
+      # simply assert any customerId they like:
+      # Auth:
+      #   Authorizers:
+      #     CognitoAuth:
+      #       IdentitySource: $request.header.Authorization
+      #       JwtConfiguration:
+      #         issuer: https://cognito-idp.REGION.amazonaws.com/USER_POOL_ID
+      #         audience:
+      #           - USER_POOL_CLIENT_ID
+      #   DefaultAuthorizer: CognitoAuth
+      AccessLogSettings:
+        DestinationArn: !GetAtt ApiAccessLogGroup.Arn
+        Format: '{"requestId":"$context.requestId","status":"$context.status","path":"$context.path","integrationError":"$context.integrationErrorMessage"}'
+
+  ApiAccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/http-api/ordering-system
+      RetentionInDays: 30
+
+  # -------------------------------------------------------------------------
+  # Custom domain — HTTPS on 443 via ACM, fronted by Route 53
+  # -------------------------------------------------------------------------
+  ApiCustomDomain:
+    Type: AWS::ApiGatewayV2::DomainName
+    Condition: UseCustomDomain
+    Properties:
+      DomainName: !Ref ApiDomainName
+      DomainNameConfigurations:
+        - CertificateArn: !Ref AcmCertificateArn
+          EndpointType: REGIONAL
+          SecurityPolicy: TLS_1_2
+
+  ApiDomainMapping:
+    Type: AWS::ApiGatewayV2::ApiMapping
+    Condition: UseCustomDomain
+    Properties:
+      ApiId: !Ref OrderingHttpApi
+      DomainName: !Ref ApiCustomDomain
+      # No ApiMappingKey, so https://<domain>/order hits the route directly
+      # with no stage prefix.
+      Stage: prod
+
+  ApiDnsRecord:
+    Type: AWS::Route53::RecordSet
+    Condition: CreateDnsRecord
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref ApiDomainName
+      Type: A
+      AliasTarget:
+        # An alias points straight at the regional endpoint: no extra CNAME
+        # hop, and AWS keeps the underlying addresses current.
+        DNSName: !GetAtt ApiCustomDomain.RegionalDomainName
+        HostedZoneId: !GetAtt ApiCustomDomain.RegionalHostedZoneId
+        EvaluateTargetHealth: false
+
+  # -------------------------------------------------------------------------
+  # Observability — an alarm nobody receives is not monitoring, so the alarms
+  # publish to their own operations topic, separate from customer email.
+  # -------------------------------------------------------------------------
+  OpsAlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: OpsAlerts
+
+  OpsAlertsSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasOpsEmail
+    Properties:
+      TopicArn: !Ref OpsAlertsTopic
+      Protocol: email
+      Endpoint: !Ref OpsAlertEmail
+
+  OrderServiceErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: OrderService-Errors
+      AlarmDescription: OrderService is returning errors; orders may not be reaching the queue.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref OrderServiceFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref OpsAlertsTopic
+
+  PaymentServiceErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: PaymentService-Errors
+      AlarmDescription: PaymentService is failing; orders will stall in PLACED.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref PaymentServiceFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref OpsAlertsTopic
+
+  OrderQueueDLQAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: OrderQueueDLQ-HasMessages
+      AlarmDescription: Messages have exhausted their retries and are being lost. Investigate.
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt OrderQueueDLQ.QueueName
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref OpsAlertsTopic
+
+Outputs:
+
+  ApiEndpoint:
+    Description: Generated execute-api invoke URL for placing an order
+    Value: !Sub "https://${OrderingHttpApi}.execute-api.${AWS::Region}.amazonaws.com/prod/order"
+
+  CustomDomainEndpoint:
+    Condition: UseCustomDomain
+    Description: Branded HTTPS endpoint
+    Value: !Sub "https://${ApiDomainName}/order"
+
+  RegionalDomainNameForDns:
+    Condition: UseCustomDomain
+    Description: >
+      Alias target for a manually created Route 53 record, when HostedZoneId
+      was not supplied.
+    Value: !GetAtt ApiCustomDomain.RegionalDomainName
+
+  OrdersTableName:
+    Description: DynamoDB table holding orders
+    Value: !Ref OrdersTable
+
+  OrderQueueUrl:
+    Description: SQS queue between order intake and payment
+    Value: !Ref OrderQueue
+
+  NotificationTopicArn:
+    Description: SNS topic for customer notifications — subscribe an email here
+    Value: !Ref NotificationTopic
+
+  OpsAlertsTopicArn:
+    Description: SNS topic that CloudWatch alarms publish to
+    Value: !Ref OpsAlertsTopic
